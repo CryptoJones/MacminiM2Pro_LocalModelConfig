@@ -1,0 +1,96 @@
+{
+  "version": "1.0",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "log_level": "info",
+    "cors_origins": [
+      "*"
+    ],
+    "server_aliases": [
+      "localhost",
+      "127.0.0.1",
+      "your-mac-mini.local",
+      "192.0.2.1"
+    ],
+    "sse_keepalive_mode": "chunk"
+  },
+  "model": {
+    "model_dirs": [
+      "/Users/you/.omlx/models"
+    ],
+    "model_dir": "/Users/you/.omlx/models",
+    "max_model_memory": "auto",
+    "model_fallback": true
+  },
+  "memory": {
+    "max_process_memory": "auto",
+    "prefill_memory_guard": true
+  },
+  "scheduler": {
+    "max_concurrent_requests": 8
+  },
+  "cache": {
+    "enabled": false,
+    "hot_cache_only": true,
+    "ssd_cache_dir": "/Users/you/.omlx/cache",
+    "ssd_cache_max_size": "46GB",
+    "hot_cache_max_size": "0",
+    "initial_cache_blocks": 256
+  },
+  "auth": {
+    "api_key": "<YOUR_API_KEY>",
+    "secret_key": "<YOUR_SECRET_KEY>",
+    "skip_api_key_verification": true,
+    "sub_keys": []
+  },
+  "mcp": {
+    "config_path": null
+  },
+  "huggingface": {
+    "endpoint": ""
+  },
+  "modelscope": {
+    "endpoint": ""
+  },
+  "network": {
+    "http_proxy": "",
+    "https_proxy": "",
+    "no_proxy": "",
+    "ca_bundle": ""
+  },
+  "sampling": {
+    "max_context_window": 65536,
+    "max_tokens": 65536,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 0,
+    "repetition_penalty": 1.0
+  },
+  "logging": {
+    "log_dir": null,
+    "retention_days": 7
+  },
+  "claude_code": {
+    "context_scaling_enabled": true,
+    "target_context_size": 30000,
+    "mode": "local",
+    "opus_model": "Qwen3-1.7B-4bit",
+    "sonnet_model": "Qwen3-1.7B-4bit",
+    "haiku_model": "Qwen3-1.7B-4bit"
+  },
+  "integrations": {
+    "codex_model": null,
+    "opencode_model": null,
+    "openclaw_model": null,
+    "pi_model": null,
+    "copilot_model": null,
+    "openclaw_tools_profile": "coding"
+  },
+  "ui": {
+    "language": "en"
+  },
+  "idle_timeout": {
+    "idle_timeout_seconds": null
+  }
+}
