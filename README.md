@@ -19,15 +19,44 @@ Captures a known-good config for serving a local model from oMLX on tight-memory
 
 ## What got us to ~85 tok/s
 
-The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 tok/s through five tunings, in roughly this order of impact:
+The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 tok/s. Every change that mattered, in roughly the order it had impact:
 
-1. **Right model tier.** Started on `Qwen2.5-Coder-7B-Instruct` (code-completion-tuned — answers prose instead of calling tools), tried `Qwen3-8B-4bit` (too heavy for 16 GB, thinking mode wastes tokens), settled on `Qwen3-4B-Instruct-2507-4bit` (2.1 GB, no thinking by default), then `Qwen3-1.7B-4bit` (~1 GB) with thinking explicitly suppressed for an additional 2× throughput.
-2. **Disabled oMLX's paged SSD cache.** oMLX 0.3.9.dev2 has a bug where the SSD KV cache thrashes on Claude Code's large system prompts — `SSD cache write queue full` warnings, `store_cache_main_prep` time grows unboundedly per request, clients hit `[stream_generate] GeneratorExit` cancellations. Setting `cache.enabled: false` eliminates the failure mode at the cost of losing prefix caching (so prompt eval is paid in full each turn).
-3. **Aligned `claude_code.target_context_size` with the model's real window.** Was at the default 200 000 (Claude's window); set to 30 000 so the local 4B / 1.7B isn't asked to handle prompts it can't actually fit.
-4. **`thinking_budget_enabled: false` for the 1.7B in `model_settings.json`.** Qwen3-1.7B is a unified-mode model (no dedicated Instruct-2507 variant exists at this size); without this setting it emits `<think>...</think>` preambles that burn the generation budget before the user-visible reply starts.
-5. **Fresh reboot after model swaps.** macOS jetsam will sometimes pin a few GB of swap from a previously-loaded larger model even after that model is unloaded; a reboot reliably drains it. Cheap, but it matters on 16 GB.
+### Model selection
 
-The realistic ceiling for this hardware is what's in this config. Prompt eval on Apple Silicon M2 Pro runs ~1500 tok/s, so a 10K-token Claude Code prompt eats ~7 s before generation starts; that's the dominant cost, not the model itself. The only big lever left is prefix caching — when oMLX fixes `hot_cache_only` (`hot_cache_only: true` is not currently honored — SSD cache still initializes), repeated Claude Code system prompts get cached in RAM and effective tok/s should ~2–3×.
+1. **Avoid code-completion-tuned models for agentic use.** Started on `Qwen2.5-Coder-7B-Instruct-MLX-4bit` (downloaded automatically by oMLX integrations). That model is fine-tuned to *write code in response to instructions*, not to call tools — so Claude Code asked it to do things and it answered with prose explaining how. Classic "gives instructions instead of acting" symptom.
+2. **Avoid models whose weight footprint plus macOS overhead exceeds RAM.** Tried `Qwen3-8B-4bit` (~4.6 GB) on 16 GB unified. Loaded fine, but combined with macOS + apps + KV cache the system stayed under heavy memory pressure, oMLX engine pool unloaded/reloaded mid-session, and effective tok/s dropped to single digits.
+3. **Prefer dedicated non-thinking ("Instruct") variants over unified-mode Qwen3 where they exist.** `Qwen3-4B-Instruct-2507-4bit` (2.1 GB) was a big jump in stability — fits comfortably, doesn't burn tokens on chain-of-thought. Hit ~40 tok/s sustained on 1k-token prompts.
+4. **Drop the model size further if the larger one isn't head-room-clear.** `Qwen3-1.7B-4bit` (~1 GB) cut prompt-eval cost in half (which is the dominant cost on this hardware) and got us to ~88 tok/s server-side, ~85 tok/s end-to-end through Claude Code. Quality drop is noticeable on complex reasoning, fine for short interactive turns.
+5. **For unified-mode Qwen3 models (no Instruct-2507 variant at that size), force-disable thinking.** Add a per-model entry to `~/.omlx/model_settings.json` with `thinking_budget_enabled: false`. Without it the model emits `<think>...</think>` preambles that eat the generation budget before the user-visible reply starts. The 1.7B has no `Instruct-2507` variant, so this is the only way to get clean output.
+
+### oMLX server tunings
+
+6. **Disable the paged SSD cache** (`cache.enabled: false`). oMLX 0.3.9.dev2 has a bug where the SSD KV cache thrashes on Claude Code's large system prompts: log fills with `SSD cache write queue full, skipping save` warnings, `store_cache_main_prep` time grows unboundedly per request (32 ms → 137 ms → 540 ms → 937 ms across 4 turns), and clients eventually hit `[stream_generate] GeneratorExit` cancellations because the server can't respond before the client times out. Disabling caching entirely is a regression vs caching working correctly (you pay full prompt eval on every turn), but it eliminates the failure mode.
+7. **Don't trust `cache.hot_cache_only: true` in 0.3.9.dev2** — the flag is silently ignored. The SSD cache still initializes (`paged SSD cache enabled: cache_dir=...` in the log) even with `hot_cache_only` set. Hot-only caching is the right long-term answer but doesn't work in this version. Track the upstream fix.
+8. **Set `claude_code.target_context_size` to match the local model's real window**, not Claude's. The default 200 000 tells Claude Code "this model has Claude's context window" and Claude Code happily sends 30–60K token prompts. Setting it to 30 000 (matching Qwen3's ~32K context) caps the prompts at what the model can actually handle without saturating prompt eval.
+9. **Clean stale model entries out of `~/.omlx/model_settings.json`.** Old per-model entries for models that no longer exist on disk trigger `WARNING - Default model 'X' not found, using first model` on every startup and can interact with model discovery in subtle ways. Set `models: {}` to a blank dict and re-add only what's actually installed.
+
+### Client-side wiring (Claude Code)
+
+10. **Tell Claude Code which Anthropic API endpoint to use:** `export ANTHROPIC_BASE_URL=http://<mini-ip>:8000`. oMLX serves the Anthropic Messages API at `/v1/messages` on the same port as the OpenAI-compatible API.
+11. **Set a placeholder API key:** `export ANTHROPIC_API_KEY=local`. oMLX's `auth.skip_api_key_verification: true` setting means the key isn't actually checked, but Claude Code refuses to start without *some* key set.
+12. **Map every Claude tier (opus/sonnet/haiku) to the local model name** via `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Claude Code sends the literal model name (`claude-haiku-4-5`, etc.) in the request body; without these env vars oMLX 404s on every request because it has no `claude-*` model loaded. The oMLX `claude_code.opus_model/sonnet_model/haiku_model` settings only apply when oMLX *launches* Claude Code via its own integration — for manual `claude` launches you must set the env vars yourself.
+13. **Consider raising `API_TIMEOUT_MS`** for sessions where prompt eval may exceed Claude Code's default request timeout (e.g., big repo context). `export API_TIMEOUT_MS=300000` (5 min) prevents premature client disconnects on cold-start requests.
+
+### macOS-level
+
+14. **Reboot after switching to a smaller model** if you were previously running a larger one. macOS will sometimes pin several GB of swap from a previously-loaded model even after that model is unloaded by oMLX, leaving the new smaller model fighting for resident memory. A reboot reliably drains the swap. Cheap, but it matters on 16 GB.
+15. **Quit memory-hungry GUI apps** (Chrome, Signal, Creative Cloud, Dropbox Helper) before serious inference. Each GB you free reduces compressor pressure on the model's working set and stops macOS from spilling KV state to swap. Activity Monitor → sort by Memory → make decisions.
+
+### What's *not* in this config but would help (future work)
+
+- **Working hot in-memory prefix cache.** When `hot_cache_only` is honored upstream, repeated Claude Code system prompts (~25K-token prefix on every turn, identical across the session) get cached and effective tok/s should ~2–3×.
+- **Speculative decoding.** oMLX supports `specprefill_enabled` for matched draft/target pairs; no public Qwen3 draft model exists today for this exact target, but Qwen2.5-0.5B works as a rough draft for Qwen2.5-class targets — a research project, not a flip.
+- **Hardware upgrade.** 32 GB+ M3/M4 Pro/Max would let you run the 4B with the cache on (when fixed), and would more-than-double prompt-eval throughput thanks to higher memory bandwidth.
+
+### Why this ceiling
+
+Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a 10K-token Claude Code prompt eats ~7 s before generation starts. That's the dominant cost on this hardware, not the model's generation speed. Until prefix caching works, every turn pays that cost in full. The 85 tok/s number you see is the *effective* rate when the prompt is small enough that generation dominates; for big-context turns, expect 15–40 tok/s effective until caching is fixed.
 
 ## Files
 
