@@ -31,11 +31,11 @@
     "max_concurrent_requests": 8
   },
   "cache": {
-    "enabled": true,
+    "enabled": false,
     "hot_cache_only": true,
     "ssd_cache_dir": "/Users/you/.omlx/cache",
     "ssd_cache_max_size": "46GB",
-    "hot_cache_max_size": "2GB",
+    "hot_cache_max_size": "0",
     "initial_cache_blocks": 256
   },
   "auth": {
