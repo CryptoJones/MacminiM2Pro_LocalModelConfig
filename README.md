@@ -33,8 +33,8 @@ The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 
 
 ### oMLX server tunings
 
-6. **Disable the paged SSD cache** (`cache.enabled: false`). oMLX 0.3.9.dev2 has a bug where the SSD KV cache thrashes on Claude Code's large system prompts: log fills with `SSD cache write queue full, skipping save` warnings, `store_cache_main_prep` time grows unboundedly per request (32 ms → 137 ms → 540 ms → 937 ms across 4 turns), and clients eventually hit `[stream_generate] GeneratorExit` cancellations because the server can't respond before the client times out. Disabling caching entirely is a regression vs caching working correctly (you pay full prompt eval on every turn), but it eliminates the failure mode.
-7. **Don't trust `cache.hot_cache_only: true` in 0.3.9.dev2** — the flag is silently ignored. The SSD cache still initializes (`paged SSD cache enabled: cache_dir=...` in the log) even with `hot_cache_only` set. Hot-only caching is the right long-term answer but doesn't work in this version. Track the upstream fix.
+6. **Use hot-cache-only mode in oMLX v0.3.9rc1+:** `cache.enabled: true`, `cache.hot_cache_only: true`, `cache.hot_cache_max_size: "2GB"`. The 2 GB hot cache holds Claude Code's repeated system-prompt prefix in RAM, skipping prompt eval on every turn after the first — measured 4.4× speedup on a 2K-token cached prefix in our testing. (Bug history: in v0.3.9.dev2 and earlier, `hot_cache_only: true` was silently ignored and the SSD cache thrashed on large prompts — `SSD cache write queue full` warnings, `store_cache_main_prep` time growing unboundedly per request, clients hitting `[stream_generate] GeneratorExit` cancellations. The workaround was `cache.enabled: false`, paying full prompt eval every turn. v0.3.9rc1 fixes this. If you must stay on dev2 or earlier, fall back to `cache.enabled: false`.)
+7. **Ignore the stale `paged SSD cache enabled` log line in v0.3.9rc1.** Even with `hot_cache_only: true` correctly working at runtime, the cache-init log still emits `paged SSD cache enabled: cache_dir=...`. The line is misleading text from a code path that wasn't updated; runtime behavior is hot-only as configured (no SSD writes — verify with `du -sh ~/.omlx/cache` not growing and no `queue full` warnings under load).
 8. **Set `claude_code.target_context_size` to match the local model's real window**, not Claude's. The default 200 000 tells Claude Code "this model has Claude's context window" and Claude Code happily sends 30–60K token prompts. Setting it to 30 000 (matching Qwen3's ~32K context) caps the prompts at what the model can actually handle without saturating prompt eval.
 9. **Clean stale model entries out of `~/.omlx/model_settings.json`.** Old per-model entries for models that no longer exist on disk trigger `WARNING - Default model 'X' not found, using first model` on every startup and can interact with model discovery in subtle ways. Set `models: {}` to a blank dict and re-add only what's actually installed.
 
@@ -52,13 +52,12 @@ The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 
 
 ### What's *not* in this config but would help (future work)
 
-- **Working hot in-memory prefix cache.** When `hot_cache_only` is honored upstream, repeated Claude Code system prompts (~25K-token prefix on every turn, identical across the session) get cached and effective tok/s should ~2–3×.
 - **Speculative decoding.** oMLX supports `specprefill_enabled` for matched draft/target pairs; no public Qwen3 draft model exists today for this exact target, but Qwen2.5-0.5B works as a rough draft for Qwen2.5-class targets — a research project, not a flip.
-- **Hardware upgrade.** 32 GB+ M3/M4 Pro/Max would let you run the 4B with the cache on (when fixed), and would more-than-double prompt-eval throughput thanks to higher memory bandwidth.
+- **Hardware upgrade.** 32 GB+ M3/M4 Pro/Max would let you run the 4B comfortably alongside a working cache, and would more-than-double prompt-eval throughput thanks to higher memory bandwidth.
 
 ### Why this ceiling
 
-Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a 10K-token Claude Code prompt eats ~7 s before generation starts. That's the dominant cost on this hardware, not the model's generation speed. Until prefix caching works, every turn pays that cost in full. The 85 tok/s number you see is the *effective* rate when the prompt is small enough that generation dominates; for big-context turns, expect 15–40 tok/s effective until caching is fixed.
+Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a cold 10K-token Claude Code prompt eats ~7 s before generation starts. With hot-cache-only working as of v0.3.9rc1, that cost is paid once at the start of a session and then skipped on every subsequent turn that shares the same system-prompt prefix — the dominant case in practice. Expect ~85 tok/s effective on warm turns and a one-time prompt-eval bill on the first turn.
 
 ## Files
 
