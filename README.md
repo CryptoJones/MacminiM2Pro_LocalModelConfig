@@ -2,6 +2,8 @@
 
 Sanitized [oMLX](https://omlx.app/) configuration for running a tool-call-capable local LLM on a 16 GB Apple Silicon M2 Pro Mac mini, fronting Claude Code (and other Anthropic-API clients) with `Qwen3-1.7B-4bit`.
 
+> oMLX is open source at [github.com/jundot/omlx](https://github.com/jundot/omlx) — bug reports, releases, and source live there.
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?logo=apache)](LICENSE)
 [![Codeberg](https://img.shields.io/badge/Codeberg-CryptoJones%2FMacminiM2Pro_LocalModelConfig-2185D0?logo=codeberg&logoColor=white)](https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig)
 [![GitHub](https://img.shields.io/badge/GitHub-CryptoJones%2FMacminiM2Pro_LocalModelConfig-181717?logo=github&logoColor=white)](https://github.com/CryptoJones/MacminiM2Pro_LocalModelConfig)
