@@ -3,7 +3,7 @@
 Sanitized configuration for running local AI workloads on a 16 GB Apple Silicon M2 Pro Mac mini:
 
 - **Tool-call-capable LLM** for Claude Code via [oMLX](https://omlx.app/) — currently `Qwen3-1.7B-4bit`, ~85 tok/s end-to-end.
-- **Image generation** via [MFLUX](https://github.com/filipstrand/mflux) — `FLUX.1-schnell` 4-bit, ~20-30 s per 1024×1024 image.
+- **Image generation** via [MFLUX](https://github.com/filipstrand/mflux) — `FLUX.1-schnell` 4-bit, ~90 s per 1024×1024 image at 4 steps.
 
 > oMLX is open source at [github.com/jundot/omlx](https://github.com/jundot/omlx) — bug reports, releases, and source live there.
 
@@ -68,12 +68,14 @@ The same 16 GB box can run a credible image model alongside (just not _simultane
 
 Why this pick:
 
-- **Fits the box.** Quantized to 4-bit via MFLUX's `--quantize 4`, the weights cap out around **6-7 GB on disk** with a **~7-9 GB peak RAM** working set during a 1024×1024 generation. Comfortable on 16 GB unified, _as long as oMLX isn't also serving Qwen3 at the same moment_ (we stop the oMLX menubar app for image-gen sessions).
-- **Apple Silicon native.** MLX runs on the unified-memory GPU path directly; no PyTorch+MPS translation layer, no CoreML conversion step. Generation time is ~20-30 s per 1024×1024 image at the model's recommended 4 inference steps. The schnell variant is _designed_ for low step counts (1-4) — the bigger FLUX.1-dev needs 20-50 steps and runs proportionally slower.
+- **Fits the box.** Pre-quantized to 4-bit via `mflux-save`, the weights are **~9 GB on disk** steady-state, with a ~9 GB peak working set during a 1024×1024 generation. Comfortable on 16 GB unified, _as long as oMLX isn't also serving Qwen3 at the same moment_ (we stop the oMLX menubar app for image-gen sessions, and we quit Chrome/Discord/Firefox/Steam/Signal too — see below for why).
+- **Apple Silicon native.** MLX runs on the unified-memory GPU path directly; no PyTorch+MPS translation layer, no CoreML conversion step. Generation time is **~22-25 s per diffusion step at 1024×1024**, so the 4-step schnell preset lands at **~90 s end-to-end** including model load, encode, and decode. The schnell variant is _designed_ for low step counts (1-4) — the bigger FLUX.1-dev needs 20-50 steps and runs proportionally slower.
 - **No built-in refusal.** FLUX.1-schnell is a base model — there is no safety-classifier layer that rejects prompts before generation. The training data is fairly clean (less explicit imagery than older SD checkpoints), but the model itself doesn't refuse and produces what you ask within whatever its weights learned. Good fit for an operator who wants "doesn't second-guess my prompts" without committing to NSFW-specialty fine-tunes.
 - **Apache 2.0.** Matches this repo's license. Commercial use OK. (FLUX.1-_dev_ is slightly higher quality but ships under FLUX.1's non-commercial license — pick `schnell` unless your use case allows the non-commercial terms.)
 
-Install + first-run is in [`configs/mflux-launch-snippet.sh`](configs/mflux-launch-snippet.sh): `pipx install mflux`, then `mflux-generate --model schnell --quantize 4 --steps 4 --width 1024 --height 1024 ...`. First generation pulls the un-quantized weights (~24 GB transient) and writes 4-bit weights under `~/.cache/mflux/`; subsequent runs reuse the quantized cache.
+Install + workflow is in [`configs/mflux-launch-snippet.sh`](configs/mflux-launch-snippet.sh). The short version: `pipx install mflux`, then **a one-time `mflux-save -m schnell -q 4 --path ~/mflux-models/schnell-4bit`** to download (~31 GB transient FP16) and quantize (9 GB final). All subsequent generations point `mflux-generate --model ~/mflux-models/schnell-4bit --base-model schnell ...` at the saved 4-bit copy — after `mflux-save` completes you can delete the 31 GB FP16 cache at `~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell` and reclaim that space.
+
+> Earlier revisions of this README claimed `mflux-generate --quantize 4` would auto-cache the 4-bit weights under `~/.cache/mflux/` after first use. That isn't how mflux 0.17.5 actually behaves — `--quantize` quantizes in-memory every cold start, and no `~/.cache/mflux/` directory is created. The `mflux-save` → `mflux-generate --model <path>` pattern above is what actually persists the quantization.
 
 ## Models we got running successfully
 
@@ -85,7 +87,7 @@ The history of what actually loaded and ran on this 16 GB M2 Pro box, in the ord
 | `Qwen3-8B-4bit` | ~4.6 GB | oMLX | Claude Code LLM (tried) | Loaded but combined with macOS + Claude Code + KV cache, the system stayed under heavy memory pressure; the oMLX engine pool unloaded/reloaded mid-session and effective throughput fell to single-digit tok/s. Replaced. |
 | `Qwen3-4B-Instruct-2507-4bit` | ~2.1 GB | oMLX | Claude Code LLM (tried) | Comfortable fit, no thinking-token waste, ~40 tok/s sustained on 1k-token prompts. A reasonable choice if you want a little more headroom on complex reasoning at the cost of throughput. |
 | **`Qwen3-1.7B-4bit`** | **~1 GB** | **oMLX** | **Claude Code LLM (current)** | **~88 tok/s server-side, ~85 tok/s end-to-end through Claude Code. Quality drop is noticeable on multi-step reasoning, fine for short interactive turns. Requires `thinking_budget_enabled: false` in `model_settings.json` because this size has no `Instruct-2507` variant.** |
-| **`FLUX.1-schnell`** (4-bit via MFLUX) | **~6-7 GB** | **MFLUX** | **Image generation (current)** | **~20-30 s per 1024×1024 at 4 steps. ~7-9 GB peak RAM. Apache 2.0, base model, no refusal layer. Don't run concurrently with oMLX on this box.** |
+| **`FLUX.1-schnell`** (4-bit via MFLUX) | **~9 GB** | **MFLUX 0.17.5** | **Image generation (current)** | **~22-25 s per diffusion step / ~90 s end-to-end at 1024×1024 / 4 steps. ~9 GB peak working set. Apache 2.0, base model, no refusal layer. Persisted via `mflux-save` once; don't run concurrently with oMLX on this box, and quit Chrome/Discord/Firefox/Steam/Signal before warmup or it'll thrash to a halt in swap.** |
 
 Possible future additions not yet evaluated: speculative-decoding draft models for the Qwen3 target, FLUX.1-dev for higher-fidelity image gen on a 32 GB upgrade, a small TTS/STT model alongside the LLM.
 
@@ -133,26 +135,40 @@ Pull the model on the mini first via the oMLX GUI's model browser, searching `ml
 # One-time on the mini:
 pipx install mflux
 
-# First generation pulls + quantizes (~24 GB transient download,
-# ~6-7 GB final on-disk). See configs/mflux-launch-snippet.sh for
-# the full annotated command.
+# One-time: download + persist a 4-bit-quantized FLUX.1-schnell to
+# disk. Downloads ~31 GB of FP16 weights into the HuggingFace cache
+# (~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell)
+# and writes the 9 GB quantized result to --path. Takes ~20 s once
+# the FP16 weights are in cache.
+mflux-save \
+    --model schnell --quantize 4 \
+    --path ~/mflux-models/schnell-4bit
+
+# Optional: reclaim ~31 GB by removing the FP16 cache. The saved
+# 4-bit model is fully self-contained and doesn't need the original.
+rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
+
+# Everyday generation — point --model at the saved 4-bit copy.
+# --base-model schnell tells mflux which sampler/step defaults to
+# use (the saved path is a directory, not the "schnell" alias).
 mflux-generate \
-    --model schnell --quantize 4 --steps 4 \
-    --width 1024 --height 1024 \
+    --model ~/mflux-models/schnell-4bit \
+    --base-model schnell \
+    --steps 4 --width 1024 --height 1024 \
     --prompt "your prompt here" \
     --output ~/Pictures/out.png
 ```
 
-**Stop the oMLX menubar app before running MFLUX on this 16 GB box.** They each fit individually but not together — running both at once pushes macOS into heavy swap and grinds both workloads.
+**Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
 
 ## Hardware assumptions
 
 - Apple Silicon M2 Pro, 16 GB unified memory
 - macOS 26+ (Tahoe-era)
 - oMLX 0.3.9.dev2 (or compatible)
-- MFLUX 0.6+ (or compatible) for image generation
+- MFLUX 0.17+ for image generation (tested on 0.17.5)
 - ~5 GB free disk for the Qwen3 LLM + cache
-- **Additional ~30 GB free disk transient (drops to ~7 GB steady-state)** if you also install FLUX.1-schnell via MFLUX
+- **Additional ~31 GB free disk transient during `mflux-save`, dropping to ~9 GB steady-state** once the FP16 HuggingFace cache is removed
 
 Bigger Apple Silicon (32 GB+, M3/M4 Max) can run the 4B comfortably and may benefit from re-enabling caching once the upstream bug is fixed. 32 GB+ also makes it practical to run the LLM and FLUX side-by-side without swap pressure.
 
