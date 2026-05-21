@@ -99,8 +99,8 @@ Possible future additions not yet evaluated: speculative-decoding draft models f
 | `configs/model_settings.json` | Per-model tuning (`~/.omlx/model_settings.json`). Currently holds the `Qwen3-1.7B-4bit` entry with thinking disabled. |
 | `configs/hermes-bashrc-snippet.sh` | Env-var block to append to the client user's `~/.bashrc` so `claude` talks to the mini and asks for the right model name. |
 | `configs/mflux-launch-snippet.sh` | One-time install + everyday `mflux-generate` invocation for FLUX.1-schnell image generation on the same mini. |
-| `scripts/flux.py` | Python wrapper that calls MFLUX's API directly (no subprocess to `mflux-generate`). Deployed to `~/.local/bin/flux` on the mini so `flux "your prompt"` Just Works from any shell. Useful when you want to script generations or invoke from another tool without parsing CLI flags. |
-| `scripts/flux-ssh.py` | Linux/non-Mac counterpart. Deployed to `~/.local/bin/flux` on the *client* machine. SSHes into the mini, runs `flux` there, then `scp`s the resulting PNG + metadata back to the client's `~/Pictures/` and cleans up the mini-side copy. Same `flux "your prompt"` UX as on the mini — the client doesn't need MLX or Apple Silicon, it just needs SSH access to the mini. Mini hostname/user are configurable via `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars; defaults target `akclark@Aarons-Mac-mini.local`. |
+| `scripts/flux.py` | Python wrapper that calls MFLUX's API directly (no subprocess to `mflux-generate`). Deployed to `~/.local/bin/flux` on the mini so `flux "your prompt"` Just Works from any shell. Supports text-to-image, single-`--image-path` img2img on schnell, and multi-`--image-path` FLUX Redux on FLUX.1-dev. Output defaults to `~/Pictures/mflux/mflux-<timestamp>.png`. |
+| `scripts/flux-ssh.py` | Linux/non-Mac counterpart. Deployed to `~/.local/bin/flux` on the *client* machine. SSHes into the mini, runs `flux` there, then `scp`s the PNG + metadata back to the client's `~/Pictures/mflux/` and cleans up the mini-side copy. Accepts multiple `--reference` flags (URL or local path; mix freely) for the Redux multi-image path. Mini hostname/user configurable via `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars; defaults target `akclark@Aarons-Mac-mini.local`. |
 
 ## How to apply
 
@@ -172,7 +172,7 @@ flux "your prompt here"
 flux "moody portrait of an octopus" --seed 1812 --width 768 --height 1344
 ```
 
-The wrapper calls MFLUX's Python API directly (no subprocess to `mflux-generate`), defaults to 1024×1024 at 4 steps with a time-derived seed, and writes output to `~/Pictures/mflux-<timestamp>.png` with a sidecar `.metadata.json`. The shebang points at the pipx-managed mflux venv interpreter so the script runs without activating anything. Loading + first inference takes ~90 s on the M2 Pro mini, same as `mflux-generate`.
+The wrapper calls MFLUX's Python API directly (no subprocess to `mflux-generate`), defaults to 1024×1024 at 4 steps with a time-derived seed, and writes output to `~/Pictures/mflux/mflux-<timestamp>.png` with a sidecar `.metadata.json`. The shebang points at the pipx-managed mflux venv interpreter so the script runs without activating anything. Loading + first inference takes ~90 s on the M2 Pro mini, same as `mflux-generate`.
 
 #### From a non-Mac client (Linux, Windows-via-WSL, another Mac)
 
@@ -185,7 +185,7 @@ install -m 0755 scripts/flux-ssh.py ~/.local/bin/flux
 
 # Then from the client:
 flux "your prompt here"
-# => image lands in <client>:~/Pictures/mflux-<timestamp>.png
+# => image lands in <client>:~/Pictures/mflux/mflux-<timestamp>.png
 ```
 
 The wrapper streams the mini's stdout in real-time (so you see the diffusion-step progress bar) and cleans up the PNG + metadata sidecar from the mini after copy. To keep the mini-side copy, pass `--keep-remote`. To point at a different mini, set `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars or edit the constants at the top of the script.
@@ -213,7 +213,29 @@ flux "watercolor of this" --reference ~/Pictures/photo.jpg --image-strength 0.25
 
 **What this is good for:** composition / lighting / context changes that keep the source's rendering style. "Same scene at night," "same subject in winter," "add fog to this," "darker color palette" — the reference provides the structural anchor and the prompt nudges the existing image in a direction. Strength 0.3-0.5 is the sweet spot for these.
 
-**What this is weak at:** style transfer onto a structured reference. "Watercolor of this photo," "anime version of this portrait," "oil painting of this landscape" — the prompt mostly fails to override the source's rendering style. The mechanical reason: schnell at 4 steps only has 3 denoising steps available at strength=0.25, which isn't enough to repaint a structured image into a different medium. The reference's style dominates. The fixes are either `--steps 8+` (works on schnell, breaks the speed budget — each step is ~22 s) or a separate FLUX.1-dev install (non-commercial license, ~4× slower per image, much better at img2img). Neither is set up here today.
+**What this is weak at:** style transfer onto a structured reference. "Watercolor of this photo," "anime version of this portrait," "oil painting of this landscape" — the prompt mostly fails to override the source's rendering style. The mechanical reason: schnell at 4 steps only has 3 denoising steps available at strength=0.25, which isn't enough to repaint a structured image into a different medium. The reference's style dominates. The fixes are either `--steps 8+` (works on schnell, breaks the speed budget — each step is ~22 s) or a separate FLUX.1-dev install (non-commercial license, ~4× slower per image, much better at img2img). The dev install is now in place for the Redux path described below, but it isn't wired into single-reference img2img today.
+
+#### Multi-image blend (FLUX Redux on FLUX.1-dev)
+
+Pass **two or more** `--reference` flags and the wrapper switches the mini-side path to **FLUX Redux on top of FLUX.1-dev**. Redux uses the SigLIP image encoder to blend the references with the prompt — the references contribute visual concepts, the prompt steers composition.
+
+```bash
+flux "a vintage travel poster blending these scenes" \
+  --reference https://example.com/photo1.jpg \
+  --reference ~/Pictures/photo2.png \
+  --reference https://example.com/photo3.jpg
+```
+
+Per-image strength is matched positionally with `--image-strength` (one per `--reference`). Defaults to `1.0` each — equal weight. Higher = that ref contributes more.
+
+**One-time install** for the Redux path: `mflux-save --model dev --quantize 4 --path ~/mflux-models/dev-4bit` (~31 GB transient FP16 download, ~9 GB persisted; same workflow as the schnell save). First multi-image generation also auto-downloads the FLUX.1-Redux-dev adapter (~3 GB) and the SigLIP encoder.
+
+**Tradeoffs vs. schnell text-to-image / img2img:**
+- **Speed:** ~140 s per 1024×1024 image (≈35 s per step × 4) vs. ~90 s for schnell. The dev transformer is bigger and the Redux pipeline adds an encode step.
+- **License:** FLUX.1-dev is **non-commercial**. Don't ship Redux outputs in a product without resolving licensing. FLUX.1-schnell (single-reference and text-to-image paths) stays Apache 2.0.
+- **Disk:** +9 GB steady-state for the saved dev-4bit on top of the schnell-4bit footprint.
+
+The proof-of-concept output (corgi-in-astronaut-helmet from one reference + Japanese tea garden from another, blended into "a corgi sitting by a koi pond in a Japanese tea garden") lives at `~/Pictures/mflux/mflux-20260520-235434.png` on the mini and on the Linux client. It is exactly as cursed as you'd expect.
 
 **Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
 
@@ -225,6 +247,7 @@ flux "watercolor of this" --reference ~/Pictures/photo.jpg --image-strength 0.25
 - MFLUX 0.17+ for image generation (tested on 0.17.5)
 - ~5 GB free disk for the Qwen3 LLM + cache
 - **Additional ~31 GB free disk transient during `mflux-save`, dropping to ~9 GB steady-state** once the FP16 HuggingFace cache is removed
+- **Another ~9 GB if you also install FLUX.1-dev for the Redux multi-image path** (`~/mflux-models/dev-4bit` plus a ~3 GB SigLIP encoder pulled lazily on first Redux generation). The dev install is non-commercial license; keep schnell as the Apache-2.0-only path if license matters.
 
 Bigger Apple Silicon (32 GB+, M3/M4 Max) can run the 4B comfortably and may benefit from re-enabling caching once the upstream bug is fixed. 32 GB+ also makes it practical to run the LLM and FLUX side-by-side without swap pressure.
 

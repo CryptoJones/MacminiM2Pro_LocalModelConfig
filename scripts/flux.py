@@ -23,7 +23,8 @@ import sys
 import time
 
 MODEL_PATH = pathlib.Path("~/mflux-models/schnell-4bit").expanduser()
-OUTPUT_DIR = pathlib.Path("~/Pictures").expanduser()
+DEV_MODEL_PATH = pathlib.Path("~/mflux-models/dev-4bit").expanduser()
+OUTPUT_DIR = pathlib.Path("~/Pictures/mflux").expanduser()
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,14 +41,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-path",
         type=pathlib.Path,
+        action="append",
         default=None,
-        help="Reference image for image-to-image generation (default: text-to-image, no reference).",
+        help=(
+            "Reference image. Pass once for img2img on schnell. Pass 2+ times "
+            "(`--image-path A --image-path B`) for FLUX Redux multi-image blend "
+            "(uses FLUX.1-dev, non-commercial license). Default: text-to-image."
+        ),
     )
     parser.add_argument(
         "--image-strength",
         type=float,
+        action="append",
         default=None,
-        help="How much the reference image influences the output: 0.0 = ignore ref (pure text2img), 1.0 = keep ref unchanged. Defaults to 0.4 when --image-path is set. (Schnell at 4 steps doesn't have much room to transform — for strong prompt-driven changes use a low strength like 0.2-0.3.)",
+        help=(
+            "Reference strength. Single value paired with single --image-path = img2img "
+            "(0.0 = ignore ref, 1.0 = keep ref, default 0.4). Multiple values paired with "
+            "multiple --image-path = per-image Redux weights (default 1.0 per image)."
+        ),
+    )
+    parser.add_argument(
+        "--dev-model-path",
+        type=pathlib.Path,
+        default=DEV_MODEL_PATH,
+        help=f"Path to mflux-save'd FLUX.1-dev 4-bit directory (used in Redux mode only; default: {DEV_MODEL_PATH}).",
     )
     parser.add_argument(
         "--output",
@@ -67,13 +84,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not args.model_path.exists():
-        print(
-            f"error: model directory not found at {args.model_path}\n"
-            f"run `mflux-save --model schnell --quantize 4 --path {args.model_path}` first.",
-            file=sys.stderr,
-        )
-        return 1
+    image_paths = args.image_path or []
+    image_strengths = args.image_strength or []
+
+    for p in image_paths:
+        if not p.exists():
+            print(f"error: reference image not found at {p}", file=sys.stderr)
+            return 1
 
     if args.seed is None:
         args.seed = int(time.time())
@@ -84,6 +101,20 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    if len(image_paths) >= 2:
+        return _generate_redux(args, image_paths, image_strengths)
+    return _generate_schnell(args, image_paths, image_strengths)
+
+
+def _generate_schnell(args, image_paths, image_strengths) -> int:
+    if not args.model_path.exists():
+        print(
+            f"error: schnell model directory not found at {args.model_path}\n"
+            f"run `mflux-save --model schnell --quantize 4 --path {args.model_path}` first.",
+            file=sys.stderr,
+        )
+        return 1
+
     print(f"loading FLUX.1-schnell from {args.model_path} ...", flush=True)
     from mflux.models.common.config import ModelConfig
     from mflux.models.flux.variants.txt2img.flux import Flux1
@@ -92,24 +123,6 @@ def main() -> int:
         model_config=ModelConfig.from_name(model_name=str(args.model_path), base_model="schnell"),
     )
 
-    if args.image_path is not None:
-        if not args.image_path.exists():
-            print(f"error: reference image not found at {args.image_path}", file=sys.stderr)
-            return 1
-        if args.image_strength is None:
-            args.image_strength = 0.4  # MFLUX default; without this, --image-path is silently ignored.
-        print(
-            f"img2img: {args.width}x{args.height} at {args.steps} steps, "
-            f"seed={args.seed}, ref={args.image_path}, "
-            f"strength={'default' if args.image_strength is None else args.image_strength}",
-            flush=True,
-        )
-    else:
-        print(
-            f"generating {args.width}x{args.height} at {args.steps} steps, seed={args.seed}",
-            flush=True,
-        )
-    t0 = time.time()
     generate_kwargs = dict(
         seed=args.seed,
         prompt=args.prompt,
@@ -117,14 +130,72 @@ def main() -> int:
         height=args.height,
         num_inference_steps=args.steps,
     )
-    if args.image_path is not None:
-        generate_kwargs["image_path"] = str(args.image_path)
-    if args.image_strength is not None:
-        generate_kwargs["image_strength"] = args.image_strength
+    if image_paths:
+        ref = image_paths[0]
+        strength = image_strengths[0] if image_strengths else 0.4
+        generate_kwargs["image_path"] = str(ref)
+        generate_kwargs["image_strength"] = strength
+        print(
+            f"img2img: {args.width}x{args.height} at {args.steps} steps, "
+            f"seed={args.seed}, ref={ref}, strength={strength}",
+            flush=True,
+        )
+    else:
+        print(f"generating {args.width}x{args.height} at {args.steps} steps, seed={args.seed}", flush=True)
+
+    t0 = time.time()
     image = flux.generate_image(**generate_kwargs)
     image.save(path=str(args.output), export_json_metadata=True)
-    elapsed = time.time() - t0
-    print(f"done in {elapsed:.1f}s -> {args.output}")
+    print(f"done in {time.time() - t0:.1f}s -> {args.output}")
+    return 0
+
+
+def _generate_redux(args, image_paths, image_strengths) -> int:
+    if not args.dev_model_path.exists():
+        print(
+            f"error: FLUX.1-dev model directory not found at {args.dev_model_path}\n"
+            f"multi-image blending uses FLUX Redux on top of dev. Run:\n"
+            f"  mflux-save --model dev --quantize 4 --path {args.dev_model_path}\n"
+            f"first. Note: FLUX.1-dev is non-commercial license.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"loading FLUX.1-dev + Redux adapter from {args.dev_model_path} ...", flush=True)
+    from mflux.models.common.config import ModelConfig
+    from mflux.models.flux.variants.redux.flux_redux import Flux1Redux
+    from mflux.models.flux.variants.redux.redux_util import ReduxUtil
+
+    flux = Flux1Redux(
+        model_config=ModelConfig.dev_redux(),
+        model_path=str(args.dev_model_path),
+    )
+
+    strengths = image_strengths if image_strengths else None
+    strengths = ReduxUtil.validate_redux_image_strengths(
+        redux_image_paths=image_paths,
+        redux_image_strengths=strengths,
+    )
+
+    print(
+        f"redux: {args.width}x{args.height} at {args.steps} steps, seed={args.seed}, "
+        f"refs={[str(p) for p in image_paths]}, "
+        f"strengths={strengths if strengths else 'default (1.0 each)'}",
+        flush=True,
+    )
+
+    t0 = time.time()
+    image = flux.generate_image(
+        seed=args.seed,
+        prompt=args.prompt,
+        width=args.width,
+        height=args.height,
+        num_inference_steps=args.steps,
+        redux_image_paths=[str(p) for p in image_paths],
+        redux_image_strengths=strengths,
+    )
+    image.save(path=str(args.output), export_json_metadata=True)
+    print(f"done in {time.time() - t0:.1f}s -> {args.output}")
     return 0
 
 

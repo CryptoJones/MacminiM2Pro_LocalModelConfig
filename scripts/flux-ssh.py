@@ -34,7 +34,7 @@ MINI_HOST = os.environ.get("FLUX_MINI_HOST", "Aarons-Mac-mini.local")
 MINI_USER = os.environ.get("FLUX_MINI_USER", "akclark")
 MINI_REMOTE_FLUX = os.environ.get("FLUX_MINI_BIN", "/Users/akclark/.local/bin/flux")
 LOCAL_OUTPUT_DIR = pathlib.Path(
-    os.environ.get("FLUX_OUTPUT_DIR", "~/Pictures")
+    os.environ.get("FLUX_OUTPUT_DIR", "~/Pictures/mflux")
 ).expanduser()
 
 
@@ -54,14 +54,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Reproducible seed (default: time-based on the mini).")
     parser.add_argument(
         "--reference",
+        action="append",
         default=None,
-        help="Reference image for image-to-image generation. Accepts an http(s) URL OR a local file path on this machine. The wrapper handles transport to the mini and cleanup.",
+        help=(
+            "Reference image (URL or local file path). Pass once for img2img on schnell. "
+            "Pass 2+ times (`--reference A --reference B`) for FLUX Redux multi-image blend "
+            "(triggers FLUX.1-dev path on the mini; non-commercial license)."
+        ),
     )
     parser.add_argument(
         "--image-strength",
         type=float,
+        action="append",
         default=None,
-        help="How much the reference image influences the output: 0.0 = ignore ref (pure text2img), 1.0 = keep ref unchanged. Defaults to 0.4 when --reference is set. For strong prompt-driven transforms with schnell, try 0.2-0.3.",
+        help=(
+            "Strength per reference. Single value with one --reference = img2img blend "
+            "(0.0 = ignore ref, 1.0 = keep ref; defaults to 0.4). Multiple values matched "
+            "positionally with multiple --reference = per-image Redux weights (defaults to 1.0 each)."
+        ),
     )
     parser.add_argument(
         "--keep-remote",
@@ -85,13 +95,13 @@ def scp_cmd(remote_path: str, local_path: pathlib.Path) -> list[str]:
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
-def stage_reference_on_mini(ref: str) -> str:
+def stage_reference_on_mini(ref: str, idx: int = 0) -> str:
     """Place the reference image on the mini and return its remote path.
 
     Accepts either an http(s) URL (downloaded on the mini via curl) or a
     local file path (scp'd to the mini). Returns the absolute remote path.
     """
-    unique = f"flux-ref-{os.getpid()}-{int(time.time())}"
+    unique = f"flux-ref-{os.getpid()}-{int(time.time())}-{idx}"
     if URL_RE.match(ref):
         ext = pathlib.Path(ref.split("?", 1)[0]).suffix.lower() or ".img"
         if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
@@ -126,12 +136,13 @@ def main() -> int:
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = f"mflux-{timestamp}.png"
-    remote_png = f"/Users/{MINI_USER}/Pictures/{filename}"
+    remote_png = f"/Users/{MINI_USER}/Pictures/mflux/{filename}"
     remote_meta = remote_png.replace(".png", ".metadata.json")
 
-    remote_ref = None
-    if args.reference is not None:
-        remote_ref = stage_reference_on_mini(args.reference)
+    references = args.reference or []
+    remote_refs: list[str] = []
+    for idx, ref in enumerate(references):
+        remote_refs.append(stage_reference_on_mini(ref, idx=idx))
 
     flux_args = [
         shlex.quote(args.prompt),
@@ -142,10 +153,11 @@ def main() -> int:
     ]
     if args.seed is not None:
         flux_args.extend(["--seed", str(args.seed)])
-    if remote_ref is not None:
-        flux_args.extend(["--image-path", remote_ref])
+    for r in remote_refs:
+        flux_args.extend(["--image-path", r])
     if args.image_strength is not None:
-        flux_args.extend(["--image-strength", str(args.image_strength)])
+        for s in args.image_strength:
+            flux_args.extend(["--image-strength", str(s)])
 
     remote_cmd = f"{MINI_REMOTE_FLUX} {' '.join(flux_args)}"
     print(f"on {MINI_HOST}: {remote_cmd}", flush=True)
@@ -175,8 +187,7 @@ def main() -> int:
     cleanup_targets = []
     if not args.keep_remote:
         cleanup_targets.extend([remote_png, remote_meta])
-    if remote_ref is not None:
-        cleanup_targets.append(remote_ref)
+    cleanup_targets.extend(remote_refs)
     if cleanup_targets:
         subprocess.run(
             ssh_cmd("rm -f " + " ".join(shlex.quote(p) for p in cleanup_targets)),
