@@ -100,6 +100,7 @@ Possible future additions not yet evaluated: speculative-decoding draft models f
 | `configs/hermes-bashrc-snippet.sh` | Env-var block to append to the client user's `~/.bashrc` so `claude` talks to the mini and asks for the right model name. |
 | `configs/mflux-launch-snippet.sh` | One-time install + everyday `mflux-generate` invocation for FLUX.1-schnell image generation on the same mini. |
 | `scripts/flux.py` | Python wrapper that calls MFLUX's API directly (no subprocess to `mflux-generate`). Deployed to `~/.local/bin/flux` on the mini so `flux "your prompt"` Just Works from any shell. Useful when you want to script generations or invoke from another tool without parsing CLI flags. |
+| `scripts/flux-ssh.py` | Linux/non-Mac counterpart. Deployed to `~/.local/bin/flux` on the *client* machine. SSHes into the mini, runs `flux` there, then `scp`s the resulting PNG + metadata back to the client's `~/Pictures/` and cleans up the mini-side copy. Same `flux "your prompt"` UX as on the mini — the client doesn't need MLX or Apple Silicon, it just needs SSH access to the mini. Mini hostname/user are configurable via `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars; defaults target `akclark@Aarons-Mac-mini.local`. |
 
 ## How to apply
 
@@ -172,6 +173,24 @@ flux "moody portrait of an octopus" --seed 1812 --width 768 --height 1344
 ```
 
 The wrapper calls MFLUX's Python API directly (no subprocess to `mflux-generate`), defaults to 1024×1024 at 4 steps with a time-derived seed, and writes output to `~/Pictures/mflux-<timestamp>.png` with a sidecar `.metadata.json`. The shebang points at the pipx-managed mflux venv interpreter so the script runs without activating anything. Loading + first inference takes ~90 s on the M2 Pro mini, same as `mflux-generate`.
+
+#### From a non-Mac client (Linux, Windows-via-WSL, another Mac)
+
+MFLUX only runs on Apple Silicon, so the model itself can't be local on a Linux box. `scripts/flux-ssh.py` solves this with the boring approach: SSH into the mini, run `flux` there, copy the result back. Install on the client side:
+
+```bash
+# On the client (Linux/WSL/another Mac), assuming ~/.ssh/config can
+# reach the mini as akclark@Aarons-Mac-mini.local:
+install -m 0755 scripts/flux-ssh.py ~/.local/bin/flux
+
+# Then from the client:
+flux "your prompt here"
+# => image lands in <client>:~/Pictures/mflux-<timestamp>.png
+```
+
+The wrapper streams the mini's stdout in real-time (so you see the diffusion-step progress bar) and cleans up the PNG + metadata sidecar from the mini after copy. To keep the mini-side copy, pass `--keep-remote`. To point at a different mini, set `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars or edit the constants at the top of the script.
+
+End-to-end timing from the Linux box on our LAN: ~93-96 s per 1024×1024 image — the SSH/scp round-trip adds ~3-5 s over running `flux` directly on the mini, mostly the scp transfer of the 1-2 MB PNG.
 
 **Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
 
