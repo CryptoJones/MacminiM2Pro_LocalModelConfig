@@ -1,6 +1,9 @@
 # MacminiM2Pro_LocalModelConfig
 
-Sanitized [oMLX](https://omlx.app/) configuration for running a tool-call-capable local LLM on a 16 GB Apple Silicon M2 Pro Mac mini, fronting Claude Code (and other Anthropic-API clients) with `Qwen3-1.7B-4bit`.
+Sanitized configuration for running local AI workloads on a 16 GB Apple Silicon M2 Pro Mac mini:
+
+- **Tool-call-capable LLM** for Claude Code via [oMLX](https://omlx.app/) — currently `Qwen3-1.7B-4bit`, ~85 tok/s end-to-end.
+- **Image generation** via [MFLUX](https://github.com/filipstrand/mflux) — `FLUX.1-schnell` 4-bit, ~20-30 s per 1024×1024 image.
 
 > oMLX is open source at [github.com/jundot/omlx](https://github.com/jundot/omlx) — bug reports, releases, and source live there.
 
@@ -59,6 +62,33 @@ The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 
 
 Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a 10K-token Claude Code prompt eats ~7 s before generation starts. On 16 GB hardware, that cost is paid in full every turn (caching off, per item 6). On 32 GB+ hardware with the hot cache enabled, the cost is paid once and then skipped on subsequent turns that share the same prefix. Expect 30–45 tok/s effective on this 16 GB mini, and 60–85 tok/s effective on bigger Apple Silicon with caching on.
 
+## Image generation: FLUX.1-schnell via MFLUX
+
+The same 16 GB box can run a credible image model alongside (just not _simultaneously with_) the LLM. We landed on **`FLUX.1-schnell`** through **[MFLUX](https://github.com/filipstrand/mflux)** — a community Apple-MLX port of Black Forest Labs' FLUX.1 family.
+
+Why this pick:
+
+- **Fits the box.** Quantized to 4-bit via MFLUX's `--quantize 4`, the weights cap out around **6-7 GB on disk** with a **~7-9 GB peak RAM** working set during a 1024×1024 generation. Comfortable on 16 GB unified, _as long as oMLX isn't also serving Qwen3 at the same moment_ (we stop the oMLX menubar app for image-gen sessions).
+- **Apple Silicon native.** MLX runs on the unified-memory GPU path directly; no PyTorch+MPS translation layer, no CoreML conversion step. Generation time is ~20-30 s per 1024×1024 image at the model's recommended 4 inference steps. The schnell variant is _designed_ for low step counts (1-4) — the bigger FLUX.1-dev needs 20-50 steps and runs proportionally slower.
+- **No built-in refusal.** FLUX.1-schnell is a base model — there is no safety-classifier layer that rejects prompts before generation. The training data is fairly clean (less explicit imagery than older SD checkpoints), but the model itself doesn't refuse and produces what you ask within whatever its weights learned. Good fit for an operator who wants "doesn't second-guess my prompts" without committing to NSFW-specialty fine-tunes.
+- **Apache 2.0.** Matches this repo's license. Commercial use OK. (FLUX.1-_dev_ is slightly higher quality but ships under FLUX.1's non-commercial license — pick `schnell` unless your use case allows the non-commercial terms.)
+
+Install + first-run is in [`configs/mflux-launch-snippet.sh`](configs/mflux-launch-snippet.sh): `pipx install mflux`, then `mflux-generate --model schnell --quantize 4 --steps 4 --width 1024 --height 1024 ...`. First generation pulls the un-quantized weights (~24 GB transient) and writes 4-bit weights under `~/.cache/mflux/`; subsequent runs reuse the quantized cache.
+
+## Models we got running successfully
+
+The history of what actually loaded and ran on this 16 GB M2 Pro box, in the order we tried them. "Got running" is generous — some loaded but were impractical for the workload. Read this with the [iteration notes above](#what-got-us-to-85-toks) for the why.
+
+| Model | Size on disk | Framework | Role | Outcome on 16 GB M2 Pro |
+|---|---|---|---|---|
+| `Qwen2.5-Coder-7B-Instruct-MLX-4bit` | ~4.2 GB | oMLX | Claude Code LLM (tried) | Loaded and served, but completion-tuned — answered Claude Code's tool requests with prose instructions instead of calling tools. Replaced. |
+| `Qwen3-8B-4bit` | ~4.6 GB | oMLX | Claude Code LLM (tried) | Loaded but combined with macOS + Claude Code + KV cache, the system stayed under heavy memory pressure; the oMLX engine pool unloaded/reloaded mid-session and effective throughput fell to single-digit tok/s. Replaced. |
+| `Qwen3-4B-Instruct-2507-4bit` | ~2.1 GB | oMLX | Claude Code LLM (tried) | Comfortable fit, no thinking-token waste, ~40 tok/s sustained on 1k-token prompts. A reasonable choice if you want a little more headroom on complex reasoning at the cost of throughput. |
+| **`Qwen3-1.7B-4bit`** | **~1 GB** | **oMLX** | **Claude Code LLM (current)** | **~88 tok/s server-side, ~85 tok/s end-to-end through Claude Code. Quality drop is noticeable on multi-step reasoning, fine for short interactive turns. Requires `thinking_budget_enabled: false` in `model_settings.json` because this size has no `Instruct-2507` variant.** |
+| **`FLUX.1-schnell`** (4-bit via MFLUX) | **~6-7 GB** | **MFLUX** | **Image generation (current)** | **~20-30 s per 1024×1024 at 4 steps. ~7-9 GB peak RAM. Apache 2.0, base model, no refusal layer. Don't run concurrently with oMLX on this box.** |
+
+Possible future additions not yet evaluated: speculative-decoding draft models for the Qwen3 target, FLUX.1-dev for higher-fidelity image gen on a 32 GB upgrade, a small TTS/STT model alongside the LLM.
+
 ## Files
 
 | Path | What it is |
@@ -66,6 +96,7 @@ Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a 10K-token
 | `configs/settings.json` | Main oMLX server settings (`~/.omlx/settings.json` on the mini). API key + secret key redacted. |
 | `configs/model_settings.json` | Per-model tuning (`~/.omlx/model_settings.json`). Currently holds the `Qwen3-1.7B-4bit` entry with thinking disabled. |
 | `configs/hermes-bashrc-snippet.sh` | Env-var block to append to the client user's `~/.bashrc` so `claude` talks to the mini and asks for the right model name. |
+| `configs/mflux-launch-snippet.sh` | One-time install + everyday `mflux-generate` invocation for FLUX.1-schnell image generation on the same mini. |
 
 ## How to apply
 
@@ -96,14 +127,34 @@ claude
 
 Pull the model on the mini first via the oMLX GUI's model browser, searching `mlx-community/Qwen3-1.7B-4bit`.
 
+### For image generation (FLUX.1-schnell via MFLUX)
+
+```bash
+# One-time on the mini:
+pipx install mflux
+
+# First generation pulls + quantizes (~24 GB transient download,
+# ~6-7 GB final on-disk). See configs/mflux-launch-snippet.sh for
+# the full annotated command.
+mflux-generate \
+    --model schnell --quantize 4 --steps 4 \
+    --width 1024 --height 1024 \
+    --prompt "your prompt here" \
+    --output ~/Pictures/out.png
+```
+
+**Stop the oMLX menubar app before running MFLUX on this 16 GB box.** They each fit individually but not together — running both at once pushes macOS into heavy swap and grinds both workloads.
+
 ## Hardware assumptions
 
 - Apple Silicon M2 Pro, 16 GB unified memory
 - macOS 26+ (Tahoe-era)
 - oMLX 0.3.9.dev2 (or compatible)
-- ~5 GB free disk for models + cache
+- MFLUX 0.6+ (or compatible) for image generation
+- ~5 GB free disk for the Qwen3 LLM + cache
+- **Additional ~30 GB free disk transient (drops to ~7 GB steady-state)** if you also install FLUX.1-schnell via MFLUX
 
-Bigger Apple Silicon (32 GB+, M3/M4 Max) can run the 4B comfortably and may benefit from re-enabling caching once the upstream bug is fixed.
+Bigger Apple Silicon (32 GB+, M3/M4 Max) can run the 4B comfortably and may benefit from re-enabling caching once the upstream bug is fixed. 32 GB+ also makes it practical to run the LLM and FLUX side-by-side without swap pressure.
 
 ## License
 
