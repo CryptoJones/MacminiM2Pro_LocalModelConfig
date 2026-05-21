@@ -192,6 +192,27 @@ The wrapper streams the mini's stdout in real-time (so you see the diffusion-ste
 
 End-to-end timing from the Linux box on our LAN: ~93-96 s per 1024×1024 image — the SSH/scp round-trip adds ~3-5 s over running `flux` directly on the mini, mostly the scp transfer of the 1-2 MB PNG.
 
+#### Image-to-image with a reference
+
+`flux` accepts an optional `--reference` that's either an http(s) URL or a local file path on the client. The wrapper handles transport (curl on the mini for URLs, scp Linux→mini for local files), passes `--image-path` to the mini-side `flux`, and cleans up the staged file from `/tmp/` after.
+
+```bash
+# Reference from a URL — curl'd onto the mini, deleted after.
+flux "a cyberpunk city" --reference https://example.com/skyline.jpg
+
+# Reference from a local file — scp'd to the mini, deleted after.
+flux "watercolor of this scene" --reference ~/Pictures/photo.jpg
+
+# Default image-strength is 0.4 when --reference is set. Lower values
+# let the prompt drive more change; higher values keep the reference
+# closer to unchanged. (See limitation below.)
+flux "watercolor of this" --reference ~/Pictures/photo.jpg --image-strength 0.25
+```
+
+**`--image-strength` semantic** (matches MFLUX's): `0.0` = ignore the reference (text-to-image), `1.0` = keep the reference unchanged. Defaults to `0.4` when a reference is supplied (without that default, MFLUX silently ignores `--image-path` and you get a plain text-to-image instead).
+
+**Limitation on schnell at 4 steps:** schnell is optimized for few-step pure generation, not style-transfer-via-img2img. Even at `--image-strength 0.25` the model only has 3 denoising steps to transform the reference, which isn't enough to fully repaint a structured image into a different medium (e.g., "watercolor of this rocket poster" mostly comes back looking like the original poster). For real style transforms, either bump `--steps` to 8+ (works on schnell, breaks the speed budget) or run FLUX.1-dev — neither is set up here. The reference _does_ visibly influence composition and color when strength is in the 0.2-0.4 range; it just won't reliably override the source's rendering style.
+
 **Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
 
 ## Hardware assumptions
