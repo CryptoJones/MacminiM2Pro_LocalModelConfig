@@ -99,6 +99,7 @@ Possible future additions not yet evaluated: speculative-decoding draft models f
 | `configs/model_settings.json` | Per-model tuning (`~/.omlx/model_settings.json`). Currently holds the `Qwen3-1.7B-4bit` entry with thinking disabled. |
 | `configs/hermes-bashrc-snippet.sh` | Env-var block to append to the client user's `~/.bashrc` so `claude` talks to the mini and asks for the right model name. |
 | `configs/mflux-launch-snippet.sh` | One-time install + everyday `mflux-generate` invocation for FLUX.1-schnell image generation on the same mini. |
+| `scripts/flux.py` | Python wrapper that calls MFLUX's API directly (no subprocess to `mflux-generate`). Deployed to `~/.local/bin/flux` on the mini so `flux "your prompt"` Just Works from any shell. Useful when you want to script generations or invoke from another tool without parsing CLI flags. |
 
 ## How to apply
 
@@ -158,6 +159,19 @@ mflux-generate \
     --prompt "your prompt here" \
     --output ~/Pictures/out.png
 ```
+
+Or, after installing `scripts/flux.py` to `~/.local/bin/flux`, the same generation collapses to:
+
+```bash
+# Install the wrapper once (chmod +x; ~/.local/bin must be on PATH):
+install -m 0755 scripts/flux.py ~/.local/bin/flux
+
+# Then from anywhere on the mini:
+flux "your prompt here"
+flux "moody portrait of an octopus" --seed 1812 --width 768 --height 1344
+```
+
+The wrapper calls MFLUX's Python API directly (no subprocess to `mflux-generate`), defaults to 1024×1024 at 4 steps with a time-derived seed, and writes output to `~/Pictures/mflux-<timestamp>.png` with a sidecar `.metadata.json`. The shebang points at the pipx-managed mflux venv interpreter so the script runs without activating anything. Loading + first inference takes ~90 s on the M2 Pro mini, same as `mflux-generate`.
 
 **Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
 
