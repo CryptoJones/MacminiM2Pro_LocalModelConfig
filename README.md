@@ -8,6 +8,8 @@
 
 > Authoritative repo is on [Codeberg](https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig); mirrored to [GitHub](https://github.com/CryptoJones/MacminiM2Pro_LocalModelConfig).
 
+> 📺 Inspired by the video [*Gemma 4 12B on a 16GB Mac Mini Is Surprisingly Capable*](https://www.youtube.com/watch?v=PDxKrp-dTDA).
+
 Gemma 4 12B is an encoder-free multimodal model (text/image/audio/video) that Google
 positions for 16 GB machines. It *fits* — but only just. On 16 GB it sits right at the
 Metal GPU memory ceiling, so a naive server **OOM-crashes on the first large prompt**.
@@ -166,3 +168,7 @@ Then use `com.cryptojones.gemma4.plist` (a per-user `LaunchAgent`) to start the 
 ## License
 
 [Apache 2.0](LICENSE). Gemma 4 is released by Google under the Apache 2.0 license.
+
+---
+
+<p align="center"><em>Proudly Made in Nebraska. Go Big Red! 🌽 <a href="https://xkcd.com/2347/">https://xkcd.com/2347/</a></em></p>
