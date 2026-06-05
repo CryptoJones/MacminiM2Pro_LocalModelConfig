@@ -4,3 +4,11 @@
 .DS_Store
 Thumbs.db
 .claude/
+
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# logs
+*.log

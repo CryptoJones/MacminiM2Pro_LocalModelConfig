@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Headless autostart for the Gemma 4 server (per-user LaunchAgent).
+
+  Install:
+    1) Edit the two ABSOLUTE paths below to match your checkout.
+    2) cp com.cryptojones.gemma4.plist ~/Library/LaunchAgents/
+    3) launchctl load ~/Library/LaunchAgents/com.cryptojones.gemma4.plist
+
+  NOTE: also persist the GPU limit at boot (see README -> "Persist the GPU limit"),
+  otherwise the server will OOM-crash after a reboot.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cryptojones.gemma4</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/CHANGE_ME/MacminiM2Pro_LocalModelConfig/.venv/bin/python</string>
+        <string>/Users/CHANGE_ME/MacminiM2Pro_LocalModelConfig/server.py</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8080</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/gemma4-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gemma4-server.log</string>
+</dict>
+</plist>

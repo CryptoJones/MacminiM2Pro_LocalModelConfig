@@ -1,0 +1,6 @@
+# Gemma 4 12B local server — Apple Silicon (MLX)
+# Install into a Python 3.12 venv (MLX has no 3.14 wheels yet); see setup.sh.
+mlx-vlm>=0.6.1
+fastapi>=0.115
+uvicorn>=0.34
+pydantic>=2.0

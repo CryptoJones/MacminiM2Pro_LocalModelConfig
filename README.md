@@ -1,258 +1,168 @@
 # MacminiM2Pro_LocalModelConfig
 
-Sanitized configuration for running local AI workloads on a 16 GB Apple Silicon M2 Pro Mac mini:
-
-- **Tool-call-capable LLM** for Claude Code via [oMLX](https://omlx.app/) — currently `Qwen3-1.7B-4bit`, ~85 tok/s end-to-end.
-- **Image generation** via [MFLUX](https://github.com/filipstrand/mflux) — `FLUX.1-schnell` 4-bit, ~90 s per 1024×1024 image at 4 steps.
-
-> oMLX is open source at [github.com/jundot/omlx](https://github.com/jundot/omlx) — bug reports, releases, and source live there.
+**Memory-safe, LAN-accessible, OpenAI-compatible server for [Gemma 4 12B](https://developers.googleblog.com/gemma-4-12b-the-developer-guide/) running locally in [MLX](https://github.com/ml-explore/mlx) on a 16 GB Apple Silicon M2 Pro Mac mini.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?logo=apache)](LICENSE)
 [![Codeberg](https://img.shields.io/badge/Codeberg-CryptoJones%2FMacminiM2Pro_LocalModelConfig-2185D0?logo=codeberg&logoColor=white)](https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig)
 [![GitHub](https://img.shields.io/badge/GitHub-CryptoJones%2FMacminiM2Pro_LocalModelConfig-181717?logo=github&logoColor=white)](https://github.com/CryptoJones/MacminiM2Pro_LocalModelConfig)
-[![Version](https://img.shields.io/badge/version-v0.1.0-orange)]()
 
-> Mirrored on both [GitHub](https://github.com/CryptoJones/MacminiM2Pro_LocalModelConfig) and
-> [Codeberg](https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig). Issues filed on
-> either are welcome; commits are pushed to both.
+> Authoritative repo is on [Codeberg](https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig); mirrored to [GitHub](https://github.com/CryptoJones/MacminiM2Pro_LocalModelConfig).
+
+Gemma 4 12B is an encoder-free multimodal model (text/image/audio/video) that Google
+positions for 16 GB machines. It *fits* — but only just. On 16 GB it sits right at the
+Metal GPU memory ceiling, so a naive server **OOM-crashes on the first large prompt**.
+This repo is the configuration and a small server wrapper that make it **safe to run
+headless** and reachable by other agents on your LAN.
 
 ---
 
-## What it does
+## The 16 GB problem (why this repo exists)
 
-Captures a known-good config for serving a local model from oMLX on tight-memory Apple Silicon hardware (16 GB unified) so that Claude Code (and any other Anthropic-API-compatible client) sees usable inference throughput — currently around **85 tok/s** end-to-end on Claude-Code-shaped prompts. The configs here are sanitized copies of what's actually deployed.
+MLX inference is bounded by the **Metal recommended working-set size** — by default
+~74 % of RAM = **11.84 GB** on a 16 GB machine. Measured peaks for Gemma 4 12B:
 
-## What got us to ~85 tok/s
+| Quant | Weights resident | Verdict on 16 GB |
+|-------|------------------|------------------|
+| `8bit` (12.7 GB) | — | ❌ won't load |
+| `6bit` (11.9 GB) | **11.85 GB peak** | ❌ saturates the GPU budget → **Metal OOM on any real prompt**; forces 3.6 GB swap just to load |
+| **`4bit` (10 GB)** | **10.99 GB load / 11.8 GB+ under load** | ✅ **only viable option** — and still needs the steps below |
 
-The setup went from 4.9 tok/s (with constant client-side cancellations) to 85.7 tok/s. Every change that mattered, in roughly the order it had impact:
+Even 4-bit peaks **scale with input length** (prefill activations, *not* just KV cache):
 
-### Model selection
+| Input prompt | Peak memory |
+|--------------|-------------|
+| ~50 tokens   | 11.80 GB |
+| ~360 tokens  | 11.80 GB |
+| ~1,560 tokens| 13.21 GB |
+| ~4,560 tokens| 💥 **OOM crash** |
 
-1. **Avoid code-completion-tuned models for agentic use.** Started on `Qwen2.5-Coder-7B-Instruct-MLX-4bit` (downloaded automatically by oMLX integrations). That model is fine-tuned to *write code in response to instructions*, not to call tools — so Claude Code asked it to do things and it answered with prose explaining how. Classic "gives instructions instead of acting" symptom.
-2. **Avoid models whose weight footprint plus macOS overhead exceeds RAM.** Tried `Qwen3-8B-4bit` (~4.6 GB) on 16 GB unified. Loaded fine, but combined with macOS + apps + KV cache the system stayed under heavy memory pressure, oMLX engine pool unloaded/reloaded mid-session, and effective tok/s dropped to single digits.
-3. **Prefer dedicated non-thinking ("Instruct") variants over unified-mode Qwen3 where they exist.** `Qwen3-4B-Instruct-2507-4bit` (2.1 GB) was a big jump in stability — fits comfortably, doesn't burn tokens on chain-of-thought. Hit ~40 tok/s sustained on 1k-token prompts.
-4. **Drop the model size further if the larger one isn't head-room-clear.** `Qwen3-1.7B-4bit` (~1 GB) cut prompt-eval cost in half (which is the dominant cost on this hardware) and got us to ~88 tok/s server-side, ~85 tok/s end-to-end through Claude Code. Quality drop is noticeable on complex reasoning, fine for short interactive turns.
-5. **For unified-mode Qwen3 models (no Instruct-2507 variant at that size), force-disable thinking.** Add a per-model entry to `~/.omlx/model_settings.json` with `thinking_budget_enabled: false`. Without it the model emits `<think>...</think>` preambles that eat the generation budget before the user-visible reply starts. The 1.7B has no `Instruct-2507` variant, so this is the only way to get clean output.
+Generation throughput: **~14–15 tokens/sec**.
 
-### oMLX server tunings
+### Two things make it safe
 
-6. **On 16 GB Apple Silicon, leave caching off: `cache.enabled: false`, `hot_cache_max_size: "0"`.** This is hardware-dependent. oMLX v0.3.9rc1 *does* fix the dev2 bug where `hot_cache_only: true` was silently ignored (you can now genuinely run RAM-only caching), and on a synthetic 2K-token repeated-prefix benchmark we measured 4.4× speedup. But on 16 GB unified, allocating even 2 GB to hot cache pushes the system into heavy swap (was at 81% swap usage / 5 GB swap during testing), prompt eval slows under page pressure, and the `GeneratorExit` cancellations come back — same symptom, different cause (memory pressure, not the rc1-fixed code bug). Real Claude Code prompts also vary turn-to-turn (timestamps, dynamic context), so cache hit rate is lower than the synthetic test suggests. Net: on 16 GB this hardware, you pay more in memory pressure than you save in cached prefixes. **On 32 GB+ Apple Silicon, set `cache.enabled: true`, `hot_cache_only: true`, `hot_cache_max_size: "4GB"` instead** — the cache benefit is real once you have headroom for it.
-7. **In rc1, the cache-init log line `paged SSD cache enabled: cache_dir=...` appears even with `hot_cache_only: true` correctly working at runtime.** The line is misleading text from a code path that wasn't updated; verify actual cache behavior with `du -sh ~/.omlx/cache` (shouldn't grow) and `grep "queue full" ~/.omlx/logs/server.log` (shouldn't fire) — not the init log string.
-8. **Set `claude_code.target_context_size` to match the local model's real window**, not Claude's. The default 200 000 tells Claude Code "this model has Claude's context window" and Claude Code happily sends 30–60K token prompts. Setting it to 30 000 (matching Qwen3's ~32K context) caps the prompts at what the model can actually handle without saturating prompt eval.
-9. **Clean stale model entries out of `~/.omlx/model_settings.json`.** Old per-model entries for models that no longer exist on disk trigger `WARNING - Default model 'X' not found, using first model` on every startup and can interact with model discovery in subtle ways. Set `models: {}` to a blank dict and re-add only what's actually installed.
+1. **Raise the Metal working-set limit** so the GPU may use more than the default 74 %.
+   For a headless box, 13.5 GB leaves ~2.9 GB for macOS:
+   ```bash
+   sudo sysctl iogpu.wired_limit_mb=13500
+   ```
+   This resets on reboot — see [persisting it](#persist-the-gpu-limit-across-reboots).
 
-### Client-side wiring (Claude Code)
+2. **Guard against oversized prompts.** `server.py` rejects prompts over
+   `MAX_INPUT_TOKENS` with **HTTP 413** instead of letting them OOM-crash the process,
+   and **serializes** requests (a second concurrent generation would double the working
+   set and OOM → **HTTP 429**).
 
-10. **Tell Claude Code which Anthropic API endpoint to use:** `export ANTHROPIC_BASE_URL=http://<mini-ip>:8000`. oMLX serves the Anthropic Messages API at `/v1/messages` on the same port as the OpenAI-compatible API.
-11. **Set a placeholder API key:** `export ANTHROPIC_API_KEY=local`. oMLX's `auth.skip_api_key_verification: true` setting means the key isn't actually checked, but Claude Code refuses to start without *some* key set.
-12. **Map every Claude tier (opus/sonnet/haiku) to the local model name** via `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Claude Code sends the literal model name (`claude-haiku-4-5`, etc.) in the request body; without these env vars oMLX 404s on every request because it has no `claude-*` model loaded. The oMLX `claude_code.opus_model/sonnet_model/haiku_model` settings only apply when oMLX *launches* Claude Code via its own integration — for manual `claude` launches you must set the env vars yourself.
-13. **Consider raising `API_TIMEOUT_MS`** for sessions where prompt eval may exceed Claude Code's default request timeout (e.g., big repo context). `export API_TIMEOUT_MS=300000` (5 min) prevents premature client disconnects on cold-start requests.
+---
 
-### macOS-level
+## Quick start
 
-14. **Reboot after switching to a smaller model** if you were previously running a larger one. macOS will sometimes pin several GB of swap from a previously-loaded model even after that model is unloaded by oMLX, leaving the new smaller model fighting for resident memory. A reboot reliably drains the swap. Cheap, but it matters on 16 GB.
-15. **Quit memory-hungry GUI apps** (Chrome, Signal, Creative Cloud, Dropbox Helper) before serious inference. Each GB you free reduces compressor pressure on the model's working set and stops macOS from spilling KV state to swap. Activity Monitor → sort by Memory → make decisions.
+```bash
+git clone https://codeberg.org/CryptoJones/MacminiM2Pro_LocalModelConfig.git
+cd MacminiM2Pro_LocalModelConfig
+./setup.sh                                  # uv venv (py3.12) + deps + downloads 4-bit weights (~10 GB)
+sudo sysctl iogpu.wired_limit_mb=13500      # raise GPU memory ceiling (per boot)
+./.venv/bin/python server.py                # serves on 0.0.0.0:8080
+```
 
-### What's *not* in this config but would help (future work)
+> **Python note:** MLX has no wheels for Python 3.14 yet. `setup.sh` pins the venv to
+> Python 3.12 via [`uv`](https://github.com/astral-sh/uv).
 
-- **Speculative decoding.** oMLX supports `specprefill_enabled` for matched draft/target pairs; no public Qwen3 draft model exists today for this exact target, but Qwen2.5-0.5B works as a rough draft for Qwen2.5-class targets — a research project, not a flip.
-- **Hardware upgrade.** 32 GB+ M3/M4 Pro/Max would let you run the 4B comfortably alongside a working cache, and would more-than-double prompt-eval throughput thanks to higher memory bandwidth.
+---
 
-### Why this ceiling
+## Using it from the LAN
 
-Prompt eval on Apple Silicon M2 Pro runs roughly 1500 tokens/sec, so a 10K-token Claude Code prompt eats ~7 s before generation starts. On 16 GB hardware, that cost is paid in full every turn (caching off, per item 6). On 32 GB+ hardware with the hot cache enabled, the cost is paid once and then skipped on subsequent turns that share the same prefix. Expect 30–45 tok/s effective on this 16 GB mini, and 60–85 tok/s effective on bigger Apple Silicon with caching on.
+The server binds `0.0.0.0:8080`, so any agent on your network can use it as an
+OpenAI-compatible endpoint. Find the host's LAN IP with `ipconfig getifaddr en0`.
 
-## Image generation: FLUX.1-schnell via MFLUX
+```bash
+curl http://<MAC_MINI_LAN_IP>:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Explain unified memory in one sentence."}],
+       "max_tokens":80}'
+```
 
-The same 16 GB box can run a credible image model alongside (just not _simultaneously with_) the LLM. We landed on **`FLUX.1-schnell`** through **[MFLUX](https://github.com/filipstrand/mflux)** — a community Apple-MLX port of Black Forest Labs' FLUX.1 family.
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://<MAC_MINI_LAN_IP>:8080/v1", api_key="not-needed")
+print(client.chat.completions.create(
+    model="mlx-community/gemma-4-12B-4bit",
+    messages=[{"role": "user", "content": "Hello!"}],
+).choices[0].message.content)
+```
 
-Why this pick:
+Endpoints: `GET /healthz`, `GET /v1/models`, `POST /v1/chat/completions`.
 
-- **Fits the box.** Pre-quantized to 4-bit via `mflux-save`, the weights are **~9 GB on disk** steady-state, with a ~9 GB peak working set during a 1024×1024 generation. Comfortable on 16 GB unified, _as long as oMLX isn't also serving Qwen3 at the same moment_ (we stop the oMLX menubar app for image-gen sessions, and we quit Chrome/Discord/Firefox/Steam/Signal too — see below for why).
-- **Apple Silicon native.** MLX runs on the unified-memory GPU path directly; no PyTorch+MPS translation layer, no CoreML conversion step. Generation time is **~22-25 s per diffusion step at 1024×1024**, so the 4-step schnell preset lands at **~90 s end-to-end** including model load, encode, and decode. The schnell variant is _designed_ for low step counts (1-4) — the bigger FLUX.1-dev needs 20-50 steps and runs proportionally slower.
-- **No built-in refusal.** FLUX.1-schnell is a base model — there is no safety-classifier layer that rejects prompts before generation. The training data is fairly clean (less explicit imagery than older SD checkpoints), but the model itself doesn't refuse and produces what you ask within whatever its weights learned. Good fit for an operator who wants "doesn't second-guess my prompts" without committing to NSFW-specialty fine-tunes.
-- **Apache 2.0.** Matches this repo's license. Commercial use OK. (FLUX.1-_dev_ is slightly higher quality but ships under FLUX.1's non-commercial license — pick `schnell` unless your use case allows the non-commercial terms.)
+> **Security:** this server has **no authentication**. Only expose it on a trusted LAN,
+> never directly to the internet. Put it behind a reverse proxy / firewall if needed.
 
-Install + workflow is in [`configs/mflux-launch-snippet.sh`](configs/mflux-launch-snippet.sh). The short version: `pipx install mflux`, then **a one-time `mflux-save -m schnell -q 4 --path ~/mflux-models/schnell-4bit`** to download (~31 GB transient FP16) and quantize (9 GB final). All subsequent generations point `mflux-generate --model ~/mflux-models/schnell-4bit --base-model schnell ...` at the saved 4-bit copy — after `mflux-save` completes you can delete the 31 GB FP16 cache at `~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell` and reclaim that space.
-
-> Earlier revisions of this README claimed `mflux-generate --quantize 4` would auto-cache the 4-bit weights under `~/.cache/mflux/` after first use. That isn't how mflux 0.17.5 actually behaves — `--quantize` quantizes in-memory every cold start, and no `~/.cache/mflux/` directory is created. The `mflux-save` → `mflux-generate --model <path>` pattern above is what actually persists the quantization.
-
-## Models we got running successfully
-
-The history of what actually loaded and ran on this 16 GB M2 Pro box, in the order we tried them. "Got running" is generous — some loaded but were impractical for the workload. Read this with the [iteration notes above](#what-got-us-to-85-toks) for the why.
-
-| Model | Size on disk | Framework | Role | Outcome on 16 GB M2 Pro |
-|---|---|---|---|---|
-| `Qwen2.5-Coder-7B-Instruct-MLX-4bit` | ~4.2 GB | oMLX | Claude Code LLM (tried) | Loaded and served, but completion-tuned — answered Claude Code's tool requests with prose instructions instead of calling tools. Replaced. |
-| `Qwen3-8B-4bit` | ~4.6 GB | oMLX | Claude Code LLM (tried) | Loaded but combined with macOS + Claude Code + KV cache, the system stayed under heavy memory pressure; the oMLX engine pool unloaded/reloaded mid-session and effective throughput fell to single-digit tok/s. Replaced. |
-| `Qwen3-4B-Instruct-2507-4bit` | ~2.1 GB | oMLX | Claude Code LLM (tried) | Comfortable fit, no thinking-token waste, ~40 tok/s sustained on 1k-token prompts. A reasonable choice if you want a little more headroom on complex reasoning at the cost of throughput. |
-| **`Qwen3-1.7B-4bit`** | **~1 GB** | **oMLX** | **Claude Code LLM (current)** | **~88 tok/s server-side, ~85 tok/s end-to-end through Claude Code. Quality drop is noticeable on multi-step reasoning, fine for short interactive turns. Requires `thinking_budget_enabled: false` in `model_settings.json` because this size has no `Instruct-2507` variant.** |
-| **`FLUX.1-schnell`** (4-bit via MFLUX) | **~9 GB** | **MFLUX 0.17.5** | **Image generation (current)** | **~22-25 s per diffusion step / ~90 s end-to-end at 1024×1024 / 4 steps. ~9 GB peak working set. Apache 2.0, base model, no refusal layer. Persisted via `mflux-save` once; don't run concurrently with oMLX on this box, and quit Chrome/Discord/Firefox/Steam/Signal before warmup or it'll thrash to a halt in swap.** |
-
-Possible future additions not yet evaluated: speculative-decoding draft models for the Qwen3 target, FLUX.1-dev for higher-fidelity image gen on a 32 GB upgrade, a small TTS/STT model alongside the LLM.
+---
 
 ## Files
 
-| Path | What it is |
-|---|---|
-| `configs/settings.json` | Main oMLX server settings (`~/.omlx/settings.json` on the mini). API key + secret key redacted. |
-| `configs/model_settings.json` | Per-model tuning (`~/.omlx/model_settings.json`). Currently holds the `Qwen3-1.7B-4bit` entry with thinking disabled. |
-| `configs/hermes-bashrc-snippet.sh` | Env-var block to append to the client user's `~/.bashrc` so `claude` talks to the mini and asks for the right model name. |
-| `configs/mflux-launch-snippet.sh` | One-time install + everyday `mflux-generate` invocation for FLUX.1-schnell image generation on the same mini. |
-| `scripts/flux.py` | Python wrapper that calls MFLUX's API directly (no subprocess to `mflux-generate`). Deployed to `~/.local/bin/flux` on the mini so `flux "your prompt"` Just Works from any shell. Supports text-to-image, single-`--image-path` img2img on schnell, and multi-`--image-path` FLUX Redux on FLUX.1-dev. Output defaults to `~/Pictures/mflux/mflux-<timestamp>.png`. |
-| `scripts/flux-ssh.py` | Linux/non-Mac counterpart. Deployed to `~/.local/bin/flux` on the *client* machine. SSHes into the mini, runs `flux` there, then `scp`s the PNG + metadata back to the client's `~/Pictures/mflux/` and cleans up the mini-side copy. Accepts multiple `--reference` flags (URL or local path; mix freely) for the Redux multi-image path. Mini hostname/user configurable via `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars; defaults target `akclark@Aarons-Mac-mini.local`. |
+| File | Purpose |
+|------|---------|
+| `server.py` | OpenAI-compatible FastAPI server with the memory-safety guards. |
+| `run.py` | One-shot CLI generation (text or image), useful for testing. |
+| `safety_test.py` | The authoritative memory/throughput test used to derive the limits above. |
+| `setup.sh` | Creates the venv, installs deps, downloads the 4-bit weights. |
+| `com.cryptojones.gemma4.plist` | Optional `launchd` agent to run the server headless at login. |
 
-## How to apply
-
-On the mini (the inference server):
+### One-shot CLI
 
 ```bash
-# Replace placeholders in settings.json with real values, then:
-cp configs/settings.json ~/.omlx/settings.json
-cp configs/model_settings.json ~/.omlx/model_settings.json
-# Restart oMLX from the menubar — settings load on server start.
+./.venv/bin/python run.py "Write a haiku about unified memory."
+./.venv/bin/python run.py "Describe this image." --image photo.jpg   # multimodal
 ```
 
-You'll need to substitute these placeholders in `configs/settings.json`:
-
-- `<YOUR_API_KEY>` — any string (the bundled config sets `skip_api_key_verification: true` so it's not enforced, but the key still has to exist)
-- `<YOUR_SECRET_KEY>` — generated once by oMLX on first launch; either reuse your existing one or let oMLX regenerate by deleting the file
-- `server_aliases` — the included list (`172.16.28.199` etc.) is operator-specific; replace with your mini's actual address
-- Paths under `/Users/akclark/` — replace with your home directory
-
-On the client (any machine running `claude`):
+### Re-run the safety test
 
 ```bash
-# Append the env vars to ~/.bashrc (idempotent: skip if already present)
-cat configs/hermes-bashrc-snippet.sh >> ~/.bashrc
-# Open a fresh shell, then:
-claude
+./.venv/bin/python safety_test.py mlx-community/gemma-4-12B-4bit --kv-bits 8 --max-kv-size 2048
 ```
 
-Pull the model on the mini first via the oMLX GUI's model browser, searching `mlx-community/Qwen3-1.7B-4bit`.
+---
 
-### For image generation (FLUX.1-schnell via MFLUX)
+## Configuration
+
+Edit the constants at the top of `server.py`:
+
+| Constant | Default | Notes |
+|----------|---------|-------|
+| `MODEL` | `mlx-community/gemma-4-12B-4bit` | The only quant that fits 16 GB. |
+| `MAX_INPUT_TOKENS` | `600` | Safety guard. ~600 in-tokens peaks ~12.1 GB. Raising it toward ~1,300 approaches the crash threshold — do so only if you raised `iogpu.wired_limit_mb` further. |
+| `MAX_OUTPUT_TOKENS` | `512` | Hard cap on generation length. |
+| `MAX_KV_SIZE` / `KV_BITS` | `2048` / `8` | Bounded, quantized KV cache. |
+
+### A note on the chat template
+
+The community MLX conversion ships **without** a `tokenizer.chat_template`. Feeding a raw
+prompt makes Gemma 4 ramble and emit `<image|>`/`<audio|>` soft-tokens. Both `server.py`
+and `run.py` apply the Gemma turn format manually
+(`<start_of_turn>user … <end_of_turn><start_of_turn>model`) and stop on `<end_of_turn>`.
+
+### Persist the GPU limit across reboots
+
+`iogpu.wired_limit_mb` resets to 0 (default) on reboot. To make a headless server
+survive reboots, install a `LaunchDaemon` that sets it at boot:
 
 ```bash
-# One-time on the mini:
-pipx install mflux
-
-# One-time: download + persist a 4-bit-quantized FLUX.1-schnell to
-# disk. Downloads ~31 GB of FP16 weights into the HuggingFace cache
-# (~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell)
-# and writes the 9 GB quantized result to --path. Takes ~20 s once
-# the FP16 weights are in cache.
-mflux-save \
-    --model schnell --quantize 4 \
-    --path ~/mflux-models/schnell-4bit
-
-# Optional: reclaim ~31 GB by removing the FP16 cache. The saved
-# 4-bit model is fully self-contained and doesn't need the original.
-rm -rf ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-schnell
-
-# Everyday generation — point --model at the saved 4-bit copy.
-# --base-model schnell tells mflux which sampler/step defaults to
-# use (the saved path is a directory, not the "schnell" alias).
-mflux-generate \
-    --model ~/mflux-models/schnell-4bit \
-    --base-model schnell \
-    --steps 4 --width 1024 --height 1024 \
-    --prompt "your prompt here" \
-    --output ~/Pictures/out.png
+sudo tee /Library/LaunchDaemons/com.cryptojones.gpulimit.plist >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cryptojones.gpulimit</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/sbin/sysctl</string><string>iogpu.wired_limit_mb=13500</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+sudo launchctl load /Library/LaunchDaemons/com.cryptojones.gpulimit.plist
 ```
 
-Or, after installing `scripts/flux.py` to `~/.local/bin/flux`, the same generation collapses to:
+Then use `com.cryptojones.gemma4.plist` (a per-user `LaunchAgent`) to start the server itself.
 
-```bash
-# Install the wrapper once (chmod +x; ~/.local/bin must be on PATH):
-install -m 0755 scripts/flux.py ~/.local/bin/flux
-
-# Then from anywhere on the mini:
-flux "your prompt here"
-flux "moody portrait of an octopus" --seed 1812 --width 768 --height 1344
-```
-
-The wrapper calls MFLUX's Python API directly (no subprocess to `mflux-generate`), defaults to 1024×1024 at 4 steps with a time-derived seed, and writes output to `~/Pictures/mflux/mflux-<timestamp>.png` with a sidecar `.metadata.json`. The shebang points at the pipx-managed mflux venv interpreter so the script runs without activating anything. Loading + first inference takes ~90 s on the M2 Pro mini, same as `mflux-generate`.
-
-#### From a non-Mac client (Linux, Windows-via-WSL, another Mac)
-
-MFLUX only runs on Apple Silicon, so the model itself can't be local on a Linux box. `scripts/flux-ssh.py` solves this with the boring approach: SSH into the mini, run `flux` there, copy the result back. Install on the client side:
-
-```bash
-# On the client (Linux/WSL/another Mac), assuming ~/.ssh/config can
-# reach the mini as akclark@Aarons-Mac-mini.local:
-install -m 0755 scripts/flux-ssh.py ~/.local/bin/flux
-
-# Then from the client:
-flux "your prompt here"
-# => image lands in <client>:~/Pictures/mflux/mflux-<timestamp>.png
-```
-
-The wrapper streams the mini's stdout in real-time (so you see the diffusion-step progress bar) and cleans up the PNG + metadata sidecar from the mini after copy. To keep the mini-side copy, pass `--keep-remote`. To point at a different mini, set `FLUX_MINI_HOST` / `FLUX_MINI_USER` env vars or edit the constants at the top of the script.
-
-End-to-end timing from the Linux box on our LAN: ~93-96 s per 1024×1024 image — the SSH/scp round-trip adds ~3-5 s over running `flux` directly on the mini, mostly the scp transfer of the 1-2 MB PNG.
-
-#### Image-to-image with a reference
-
-`flux` accepts an optional `--reference` that's either an http(s) URL or a local file path on the client. The wrapper handles transport (curl on the mini for URLs, scp Linux→mini for local files), passes `--image-path` to the mini-side `flux`, and cleans up the staged file from `/tmp/` after.
-
-```bash
-# Reference from a URL — curl'd onto the mini, deleted after.
-flux "a cyberpunk city" --reference https://example.com/skyline.jpg
-
-# Reference from a local file — scp'd to the mini, deleted after.
-flux "watercolor of this scene" --reference ~/Pictures/photo.jpg
-
-# Default image-strength is 0.4 when --reference is set. Lower values
-# let the prompt drive more change; higher values keep the reference
-# closer to unchanged. (See limitation below.)
-flux "watercolor of this" --reference ~/Pictures/photo.jpg --image-strength 0.25
-```
-
-**`--image-strength` semantic** (matches MFLUX's): `0.0` = ignore the reference (text-to-image), `1.0` = keep the reference unchanged. Defaults to `0.4` when a reference is supplied (without that default, MFLUX silently ignores `--image-path` and you get a plain text-to-image instead).
-
-**What this is good for:** composition / lighting / context changes that keep the source's rendering style. "Same scene at night," "same subject in winter," "add fog to this," "darker color palette" — the reference provides the structural anchor and the prompt nudges the existing image in a direction. Strength 0.3-0.5 is the sweet spot for these.
-
-**What this is weak at:** style transfer onto a structured reference. "Watercolor of this photo," "anime version of this portrait," "oil painting of this landscape" — the prompt mostly fails to override the source's rendering style. The mechanical reason: schnell at 4 steps only has 3 denoising steps available at strength=0.25, which isn't enough to repaint a structured image into a different medium. The reference's style dominates. The fixes are either `--steps 8+` (works on schnell, breaks the speed budget — each step is ~22 s) or a separate FLUX.1-dev install (non-commercial license, ~4× slower per image, much better at img2img). The dev install is now in place for the Redux path described below, but it isn't wired into single-reference img2img today.
-
-#### Multi-image blend (FLUX Redux on FLUX.1-dev)
-
-Pass **two or more** `--reference` flags and the wrapper switches the mini-side path to **FLUX Redux on top of FLUX.1-dev**. Redux uses the SigLIP image encoder to blend the references with the prompt — the references contribute visual concepts, the prompt steers composition.
-
-```bash
-flux "a vintage travel poster blending these scenes" \
-  --reference https://example.com/photo1.jpg \
-  --reference ~/Pictures/photo2.png \
-  --reference https://example.com/photo3.jpg
-```
-
-Per-image strength is matched positionally with `--image-strength` (one per `--reference`). Defaults to `1.0` each — equal weight. Higher = that ref contributes more.
-
-**One-time install** for the Redux path: `mflux-save --model dev --quantize 4 --path ~/mflux-models/dev-4bit` (~31 GB transient FP16 download, ~9 GB persisted; same workflow as the schnell save). First multi-image generation also auto-downloads the FLUX.1-Redux-dev adapter (~3 GB) and the SigLIP encoder.
-
-**Tradeoffs vs. schnell text-to-image / img2img:**
-- **Speed:** ~140 s per 1024×1024 image (≈35 s per step × 4) vs. ~90 s for schnell. The dev transformer is bigger and the Redux pipeline adds an encode step.
-- **License:** FLUX.1-dev is **non-commercial**. Don't ship Redux outputs in a product without resolving licensing. FLUX.1-schnell (single-reference and text-to-image paths) stays Apache 2.0.
-- **Disk:** +9 GB steady-state for the saved dev-4bit on top of the schnell-4bit footprint.
-
-The proof-of-concept output (corgi-in-astronaut-helmet from one reference + Japanese tea garden from another, blended into "a corgi sitting by a koi pond in a Japanese tea garden") lives at `~/Pictures/mflux/mflux-20260520-235434.png` on the mini and on the Linux client. It is exactly as cursed as you'd expect.
-
-**Before running MFLUX on this 16 GB box, quit oMLX _and_ the heavy GUI apps** (Chrome, Discord, Firefox, Steam, Signal). They each fit individually but the warmup needs roughly 9 GB of resident headroom, and on a freshly-booted system with all of those open, MFLUX silently stalls in swap thrash — the process keeps running but never makes diffusion-step progress. Empirically the first warmup ran for ~48 minutes at 1.5% CPU / 66 MB RSS before being killed; after quitting those apps it completed in 91 s.
-
-## Hardware assumptions
-
-- Apple Silicon M2 Pro, 16 GB unified memory
-- macOS 26+ (Tahoe-era)
-- oMLX 0.3.9.dev2 (or compatible)
-- MFLUX 0.17+ for image generation (tested on 0.17.5)
-- ~5 GB free disk for the Qwen3 LLM + cache
-- **Additional ~31 GB free disk transient during `mflux-save`, dropping to ~9 GB steady-state** once the FP16 HuggingFace cache is removed
-- **Another ~9 GB if you also install FLUX.1-dev for the Redux multi-image path** (`~/mflux-models/dev-4bit` plus a ~3 GB SigLIP encoder pulled lazily on first Redux generation). The dev install is non-commercial license; keep schnell as the Apache-2.0-only path if license matters.
-
-Bigger Apple Silicon (32 GB+, M3/M4 Max) can run the 4B comfortably and may benefit from re-enabling caching once the upstream bug is fixed. 32 GB+ also makes it practical to run the LLM and FLUX side-by-side without swap pressure.
+---
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
-
-Proudly Made in Nebraska. Go Big Red! 🌽 https://xkcd.com/2347/
+[Apache 2.0](LICENSE). Gemma 4 is released by Google under the Apache 2.0 license.
